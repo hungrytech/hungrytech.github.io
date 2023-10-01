@@ -1,6 +1,6 @@
 module.exports = {
-  title: `zoomkoding.com`,
-  description: `줌코딩의 개발일기`,
+  title: `hungryDeveloper`,
+  description: `배고픈개발자의 조각모음`,
   language: `ko`, // `ko`, `en` => currently support versions for Korean and English
   siteUrl: `https://www.zoomkoding.com`,
   ogImage: `/og-image.png`, // Path to your in the 'static' folder
@@ -14,13 +14,13 @@ module.exports = {
     name: `이택민`,
     bio: {
       role: `개발자`,
-      description: ['사람에 가치를 두는', '능동적으로 일하는', '이로운 것을 만드는'],
-      thumbnail: 'sample.png', // Path to the image in the 'asset' folder
+      description: ['고객에 가치를 두는', '주도적으로 일하는'],
+      thumbnail: 'profile_image.jpeg', // Path to the image in the 'asset' folder
     },
     social: {
-      github: ``, // `https://github.com/zoomKoding`,
-      linkedIn: ``, // `https://www.linkedin.com/in/jinhyeok-jeong-800871192`,
-      email: ``, // `zoomkoding@gmail.com`,
+      github: `https://github.com/hungrytech`, // `https://github.com/zoomKoding`,
+      linkedIn: `https://www.linkedin.com/in/taekmin-lee-74712928b/`, // `https://www.linkedin.com/in/jinhyeok-jeong-800871192`,
+      email: `xorals9448@gmail.com`, // `zoomkoding@gmail.com`,
     },
   },
 
@@ -43,7 +43,7 @@ module.exports = {
       // ========================================================
       // ========================================================
       {
-        date: '2021.02 ~',
+        date: '2023.02 ~',
         activity: '개인 블로그 개발 및 운영',
         links: {
           post: '/gatsby-starter-zoomkoding-introduction',
