@@ -218,9 +218,11 @@ Redisson은 **Lock Watchdog**을 통해 락 만료 문제를 해결합니다:
 
 Redisson의 RLock이 내부적으로 어떻게 동작하는지 [소스 코드](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLock.java)를 기반으로 분석합니다.
 
-### Redis 자료구조: Hash
+### Redis 자료구조: Hash와 재진입(Reentrant) 지원
 
 Redisson은 **재진입 락(Reentrant Lock)**을 지원하기 위해 단순 String이 아닌 **Hash** 자료구조를 사용합니다.
+
+> ⚠️ **중요**: Hash에 저장되는 값은 "대기회수"가 아니라 **"재진입 횟수(reentrant count)"**입니다!
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -229,13 +231,70 @@ Redisson은 **재진입 락(Reentrant Lock)**을 지원하기 위해 단순 Stri
 │  Field                      │  Value                        │
 ├─────────────────────────────┼───────────────────────────────┤
 │  "UUID:threadId"            │  재진입 횟수 (예: 2)           │
-│  예: "6f3a...:45"           │                               │
+│  예: "6f3a...:45"           │  (같은 스레드가 lock()을       │
+│                             │   몇 번 호출했는지)            │
 └─────────────────────────────┴───────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │  Pub/Sub Channel: "redisson_lock__channel:{myLock}"         │
 │  └── unlock 시 UNLOCK_MESSAGE 발행                          │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### 재진입(Reentrant)이 필요한 이유
+
+재진입을 지원하지 않으면 **같은 스레드가 이미 획득한 락을 다시 획득하려 할 때 데드락**이 발생합니다:
+
+```kotlin
+// 재진입이 필요한 상황 예시
+class OrderService(private val lock: RLock) {
+    
+    fun methodA() {
+        lock.lock()
+        try {
+            // 비즈니스 로직...
+            methodB()  // 같은 락을 또 획득해야 함!
+        } finally {
+            lock.unlock()
+        }
+    }
+    
+    fun methodB() {
+        lock.lock()   // 재진입! count가 2가 됨
+        try {
+            // 비즈니스 로직...
+        } finally {
+            lock.unlock()  // count가 1로 감소 (락은 아직 유지됨)
+        }
+    }
+}
+```
+
+**재진입 카운터 동작:**
+```
+methodA() 진입 → lock.lock() → Hash["UUID:45"] = 1
+    └── methodB() 진입 → lock.lock() → Hash["UUID:45"] = 2  (재진입!)
+    └── methodB() 종료 → lock.unlock() → Hash["UUID:45"] = 1
+methodA() 종료 → lock.unlock() → Hash 삭제, PUBLISH로 대기자 알림
+```
+
+### Non-Fair Lock 특성
+
+```java
+/**
+ * Implements a <b>non-fair</b> locking so doesn't guarantees an acquire order.
+ */
+public class RedissonLock extends RedissonBaseLock {
+```
+
+`RedissonLock`은 **non-fair** 락입니다. **먼저 대기했다고 먼저 획득하는 것이 아닙니다.** 대기 순서를 보장받으려면 `RedissonFairLock`을 사용해야 합니다:
+
+```kotlin
+// Non-fair lock (기본) - 순서 보장 없음
+val lock = redisson.getLock("myLock")
+
+// Fair lock - FIFO 순서 보장 (별도의 Redis List로 대기열 관리)
+val fairLock = redisson.getFairLock("myLock")
 ```
 
 ### 락 획득 Lua 스크립트 (tryLockInnerAsync)
@@ -396,19 +455,44 @@ private fun lock(leaseTime: Long, unit: TimeUnit, interruptibly: Boolean) {
 
 ### RedissonLockEntry와 Semaphore
 
-```kotlin
-// 대기자 관리를 위한 내부 클래스 (개념적 구현)
-class RedissonLockEntry {
-    // Semaphore로 blocking 대기 구현
-    val latch = Semaphore(0)
-    
-    // Pub/Sub 메시지 수신 시 호출되는 리스너
-    val listener: MessageListener = { message ->
-        if (message == UNLOCK_MESSAGE) {
-            latch.release()  // 대기 중인 스레드 깨우기
-        }
+> ⚠️ **Semaphore는 RedissonLock에 직접 있지 않습니다!** `RedissonLockEntry` 클래스에 캡슐화되어 있습니다.
+
+[RedissonLockEntry.java](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLockEntry.java) 소스:
+
+```java
+// 실제 Redisson 소스 코드
+import java.util.concurrent.Semaphore;
+
+public class RedissonLockEntry implements PubSubEntry<RedissonLockEntry> {
+
+    private final Semaphore latch;  // 여기에 Semaphore가 있음!
+
+    public RedissonLockEntry(CompletableFuture<RedissonLockEntry> promise) {
+        this.latch = new Semaphore(0);  // 초기값 0으로 생성
+        this.promise = promise;
+    }
+
+    public Semaphore getLatch() {
+        return latch;
     }
 }
+```
+
+**클래스별 역할 정리:**
+
+| 클래스 | 역할 |
+|--------|------|
+| `RedissonLock` | 락 획득/해제 로직, `entry.getLatch()` 호출로 Semaphore 접근 |
+| `RedissonLockEntry` | **Semaphore를 실제로 들고 있는 클래스** |
+| `LockPubSub` | Redis Pub/Sub 메시지 수신 시 `latch.release()` 호출 |
+
+**동작 흐름:**
+```
+1. 락 획득 실패 → subscribe() 호출로 RedissonLockEntry 생성
+2. entry.getLatch().tryAcquire(ttl, ...) → Semaphore에서 대기 (blocking)
+3. 락 해제 시 Redis Pub/Sub으로 UNLOCK_MESSAGE 발행
+4. LockPubSub이 메시지 수신 → latch.release() 호출
+5. 대기 중인 스레드 깨어남 → 락 재시도
 ```
 
 ### Watchdog TTL 갱신 스크립트
@@ -491,9 +575,10 @@ return 0;
 | **자료구조** | Hash (재진입 카운터 저장) |
 | **락 식별자** | `UUID:threadId` |
 | **채널명** | `redisson_lock__channel:{lockName}` |
-| **대기 방식** | Semaphore + Pub/Sub Listener |
+| **대기 방식** | `RedissonLockEntry` 내부의 Semaphore + Pub/Sub Listener |
 | **TTL 갱신** | Watchdog 스케줄러 (10초 주기) |
 | **원자성** | Lua 스크립트로 보장 |
+| **공정성** | Non-fair (순서 보장 안됨, Fair Lock은 별도) |
 
 ---
 
@@ -799,5 +884,6 @@ class Singleflight<K, V> {
 - [Distributed Locks with Redis — Redis Documentation](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 - [Redisson Locks and Synchronizers](https://redisson.pro/docs/data-and-services/locks-and-synchronizers/)
 - [RedissonLock.java — GitHub Source](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLock.java)
+- [RedissonLockEntry.java — GitHub Source](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLockEntry.java)
 - [Implementation Principles and Best Practices of Distributed Lock — Alibaba Cloud](https://www.alibabacloud.com/blog/implementation-principles-and-best-practices-of-distributed-lock_600811)
 - [python-redis-lock — GitHub](https://github.com/ionelmc/python-redis-lock)
