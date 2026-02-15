@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Post · hungrytech.dev</title>
+  <link rel="stylesheet" href="style.css">
+  <link id="hljs-css" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="site-logo">hungrytech.dev</a>
+    <button id="theme-toggle" class="theme-btn" aria-label="테마 전환">🌙</button>
+  </div>
+</header>
+
+<div class="post-layout">
+  <a href="/" class="back-btn">← 목록으로</a>
+  <header id="post-head" class="post-head"></header>
+  <article id="post-body" class="markdown-body">
+    <p class="state-msg">로딩 중...</p>
+  </article>
+</div>
+
+<footer class="site-footer">
+  <p>© 2026 hungrytech · Powered by GitHub Pages</p>
+</footer>
+
+<script>
+  /* —— 테마 —— */
+  const root = document.documentElement;
+  const btn  = document.getElementById('theme-toggle');
+  const hljsCss = document.getElementById('hljs-css');
+  const HLJS = {
+    light: 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css',
+    dark:  'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css',
+  };
+  const apply = t => {
+    root.dataset.theme = t;
+    btn.textContent = t === 'dark' ? '☀️' : '🌙';
+    hljsCss.href = HLJS[t];
+  };
+  apply(localStorage.getItem('theme') || 'light');
+  btn.addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    localStorage.setItem('theme', next); apply(next);
+  });
+
+  /* —— marked 설정 —— */
+  marked.setOptions({ gfm: true, breaks: true });
+  const renderer = new marked.Renderer();
+  renderer.code = (code, lang) => {
+    const hl = lang && hljs.getLanguage(lang)
+      ? hljs.highlight(code, { language: lang }).value
+      : hljs.highlightAuto(code).value;
+    return `<pre><code class="hljs language-${lang || ''}">${hl}</code></pre>`;
+  };
+  marked.use({ renderer });
+
+  /* —— 포스트 로드 —— */
+  async function load() {
+    const slug = new URLSearchParams(location.search).get('slug');
+    if (!slug) {
+      document.getElementById('post-body').innerHTML =
+        '<p class="state-msg err">슬러그가 없습니다.</p>';
+      return;
+    }
+
+    let meta = null;
+    try {
+      const idx = await (await fetch('posts/index.json')).json();
+      meta = idx.find(p => p.slug === slug);
+    } catch {}
+
+    if (meta) {
+      document.title = `${meta.title} · hungrytech.dev`;
+      document.getElementById('post-head').innerHTML = `
+        <div class="card-meta">
+          <span class="card-date">${meta.date}</span>
+          ${meta.category ? `<span class="card-cat">${meta.category}</span>` : ''}
+        </div>
+        <h1 class="post-title">${meta.title}</h1>
+        ${meta.description ? `<p class="post-desc">${meta.description}</p>` : ''}
+        <hr class="post-rule">
+      `;
+    }
+
+    try {
+      const md = await (await fetch(`posts/${slug}.md`)).text();
+      document.getElementById('post-body').innerHTML = marked.parse(md);
+    } catch {
+      document.getElementById('post-body').innerHTML =
+        '<p class="state-msg err">포스트를 찾을 수 없습니다.</p>';
+    }
+  }
+  load();
+</script>
+</body>
+</html>
