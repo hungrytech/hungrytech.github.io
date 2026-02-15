@@ -247,33 +247,284 @@ public void warmCache() {
 
 ---
 
-## 권장 조합
+## SWR의 Stale 데이터 문제와 해결
 
-### 일반적인 상황
-```
-TTL Jitter + Singleflight + 분산 락
+SWR + TTL Jitter + Proactive Warming 조합은 응답 속도 면에서 우수하지만, **Stale 데이터를 반환하는 것이 본질적인 Trade-off**입니다. 잘못된 데이터를 보여줄 수 있다는 위험이 존재합니다.
+
+### Stale이 문제가 되는 데이터
+
+| 데이터 유형 | 예시 | Stale 위험도 |
+|-------------|------|-------------|
+| 금융 데이터 | 계좌 잔액, 주문 금액 | 치명적 |
+| 재고 데이터 | 상품 수량, 좌석 수 | 높음 |
+| 상태 데이터 | 온라인/오프라인, 주문 상태 | 높음 |
+| 권한 데이터 | 접근 권한, 토큰 유효성 | 높음 |
+| 콘텐츠 데이터 | 상품 설명, 프로필 | 낮음 |
+| 정적 데이터 | 카테고리, 설정값 | 매우 낮음 |
+
+### 해결 방법 1: Stale 허용 시간 제한 (stale-max-age)
+
+무한정 stale을 허용하지 않고, 최대 허용 시간을 설정합니다.
+
+```java
+public Data getData(String key) {
+    CacheEntry entry = cache.getEntry(key);
+    
+    if (entry == null) {
+        return fetchAndCache(key);
+    }
+    
+    long staleTime = System.currentTimeMillis() - entry.getExpiredAt();
+    
+    if (staleTime > STALE_MAX_AGE) {
+        // stale 허용 시간 초과: 동기적으로 새 데이터 조회 (차단)
+        return fetchAndCache(key);
+    }
+    
+    if (entry.isExpired()) {
+        // stale 허용 범위 내: 비동기 갱신 + stale 반환
+        asyncRefresh(key);
+        return entry.getValue();
+    }
+    
+    return entry.getValue();
+}
 ```
 
-### 높은 가용성이 중요한 경우
+**타임라인 시각화**:
 ```
-SWR + TTL Jitter + Proactive Warming
+|-------- TTL --------|-- stale 허용 --|-- 차단 --|
+                    만료            stale-max-age
+                     ↓                    ↓
+                 SWR 동작            동기 조회 강제
 ```
 
-### 데이터 일관성이 중요한 경우
+### 해결 방법 2: 데이터 중요도별 전략 분리
+
+모든 데이터에 SWR을 적용하지 않습니다. 데이터 특성에 따라 전략을 다르게 적용합니다.
+
+```java
+public enum CacheStrategy {
+    STRICT,      // 절대 stale 불가 (잔액, 재고)
+    SWR,         // stale 허용 (상품 정보, 프로필)
+    AGGRESSIVE   // 긴 stale 허용 (정적 콘텐츠)
+}
+
+public Data getData(String key, CacheStrategy strategy) {
+    return switch (strategy) {
+        case STRICT -> getStrict(key);      // 항상 최신 보장
+        case SWR -> getSWR(key);            // stale 허용
+        case AGGRESSIVE -> getAggressive(key);
+    };
+}
+
+// STRICT: 캐시 없거나 만료 시 무조건 DB 조회
+private Data getStrict(String key) {
+    Data cached = cache.get(key);
+    if (cached == null || isExpired(key)) {
+        return fetchAndCache(key);
+    }
+    return cached;
+}
 ```
-분산 락 + Singleflight
+
+**전략별 적용 예시**:
+| 전략 | 데이터 예시 | 특징 |
+|------|------------|------|
+| STRICT | 계좌 잔액, 재고, 권한 | SWR 사용 안함, 분산 락 적용 |
+| SWR | 상품 상세, 사용자 프로필 | stale 허용, 빠른 응답 |
+| AGGRESSIVE | 카테고리 목록, 설정값 | 긴 stale 허용, 최소 갱신 |
+
+### 해결 방법 3: Write-Through Invalidation (이벤트 기반 무효화)
+
+데이터 변경 시 즉시 캐시를 무효화하여 stale 기간을 최소화합니다.
+
+```java
+@Transactional
+public void updateProduct(Product product) {
+    db.update(product);
+    
+    // 방법 1: 즉시 삭제 (다음 조회 시 새로 로드)
+    cache.delete("product:" + product.getId());
+    
+    // 방법 2: 즉시 갱신 (Write-through)
+    cache.set("product:" + product.getId(), product, TTL);
+    
+    // 방법 3: 이벤트 발행 (분산 환경)
+    eventPublisher.publish(new ProductUpdatedEvent(product.getId()));
+}
+
+// 이벤트 구독 (다른 서버들도 캐시 무효화)
+@EventListener
+public void onProductUpdated(ProductUpdatedEvent event) {
+    cache.delete("product:" + event.getProductId());
+}
 ```
+
+**핵심 인사이트**: 읽기에서 stale을 허용하되, **쓰기 시점에 즉시 무효화**하면 실제 stale 기간이 대폭 줄어듭니다.
+
+### 해결 방법 4: Proactive Warming 주기 최적화
+
+Stale 발생 자체를 줄이기 위해 Warming 주기를 조정합니다.
+
+```java
+@Scheduled(fixedRate = 30000)  // 30초마다 (더 빈번하게)
+public void warmCache() {
+    for (String key : getHotKeys()) {
+        Long ttl = cache.ttl(key);
+        
+        // TTL이 전체의 20% 이하로 남으면 미리 갱신
+        // 예: 300초 TTL → 60초 남았을 때 갱신
+        if (ttl != null && ttl < BASE_TTL * 0.2) {
+            refreshAsync(key);
+        }
+    }
+}
+```
+
+**Warming 주기와 Stale 확률 관계**:
+```
+TTL: 300초, Warming 임계값: 60초
+
+Warming 주기 30초 → Stale 확률 낮음 (거의 항상 갱신됨)
+Warming 주기 60초 → Stale 확률 중간
+Warming 주기 120초 → Stale 확률 높음 (놓칠 수 있음)
+```
+
+### 해결 방법 5: 버전/타임스탬프 제공 (클라이언트 판단)
+
+Stale 데이터임을 명시하고 클라이언트가 판단하게 합니다.
+
+```java
+public class CacheResponse<T> {
+    private T data;
+    private long cachedAt;      // 캐시된 시점
+    private boolean isStale;    // stale 여부
+    private long staleSeconds;  // stale 경과 시간
+}
+
+// 클라이언트/프론트엔드에서 판단
+if (response.isStale() && response.getStaleSeconds() > 30) {
+    showWarning("데이터가 최신이 아닐 수 있습니다");
+    // 또는 강제 새로고침 트리거
+}
+```
+
+---
+
+## Trade-off 분석: 일관성 vs 가용성
+
+Cache Stampede 해결책을 선택할 때 핵심은 **CAP 이론의 일관성(Consistency)과 가용성(Availability) 사이의 Trade-off**입니다.
+
+### Trade-off 스펙트럼
+
+```
+강한 일관성                                      높은 가용성
+    ←─────────────────────────────────────────────→
+    │                                             │
+ 분산 락              XFetch           SWR + Warming
+ Singleflight                        TTL Jitter
+    │                                             │
+ 최신 데이터 보장        균형점          빠른 응답 보장
+ 응답 지연 발생                        stale 허용
+```
+
+### 상황별 Trade-off 판단 기준
+
+| 판단 기준 | 일관성 우선 | 가용성 우선 |
+|-----------|------------|------------|
+| 데이터 변경 빈도 | 자주 변경됨 | 거의 변경 없음 |
+| 잘못된 데이터 비용 | 비용 큼 (금융, 재고) | 비용 낮음 (프로필) |
+| 사용자 기대 | 정확한 정보 필요 | 빠른 응답 선호 |
+| 트래픽 패턴 | 낮은 동시성 | 높은 동시성 |
+| 복구 가능성 | 복구 어려움 | 재시도/새로고침 가능 |
+
+### 실전 적용 매트릭스
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  데이터 중요도별 전략                     │
+├─────────────────┬───────────────────────────────────────┤
+│   CRITICAL      │  분산 락 + Singleflight               │
+│   (잔액, 재고)   │  → SWR 절대 사용 안함                  │
+│                 │  → Write-Through 필수                 │
+├─────────────────┼───────────────────────────────────────┤
+│   IMPORTANT     │  SWR + stale-max-age (짧게)           │
+│   (주문 상태)    │  + Write-Through Invalidation         │
+│                 │  + Proactive Warming (짧은 주기)       │
+├─────────────────┼───────────────────────────────────────┤
+│   NORMAL        │  SWR + TTL Jitter                     │
+│   (상품, 프로필) │  + Proactive Warming (일반 주기)       │
+├─────────────────┼───────────────────────────────────────┤
+│   LOW           │  긴 TTL + TTL Jitter                  │
+│   (정적 콘텐츠)  │  + 느슨한 Warming                     │
+└─────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+## 권장 조합 (Trade-off 기반)
+
+### 1. 일관성 우선 조합
+**적합한 경우**: 금융 데이터, 재고 관리, 권한 시스템
+
+```
+분산 락 + Singleflight + Write-Through Invalidation
+```
+
+- Stampede 방지: 분산 락으로 하나의 요청만 DB 접근
+- 중복 제거: Singleflight로 노드 내 요청 병합
+- 즉시 갱신: 데이터 변경 시 캐시 즉시 무효화
+- **Trade-off**: 락 대기로 인한 응답 지연 발생
+
+### 2. 균형 조합
+**적합한 경우**: 일반적인 비즈니스 데이터, API 응답
+
+```
+XFetch/PER + TTL Jitter + Write-Through Invalidation
+```
+
+- 확률적 조기 갱신으로 만료 전 선제 대응
+- TTL 분산으로 동시 만료 방지
+- 쓰기 시점 무효화로 stale 기간 최소화
+- **Trade-off**: 완벽한 일관성/응답속도 둘 다 보장하지 않음
+
+### 3. 가용성 우선 조합
+**적합한 경우**: 콘텐츠 서비스, 높은 트래픽, 사용자 경험 중시
+
+```
+SWR + stale-max-age + TTL Jitter + Proactive Warming + Write-Through
+```
+
+- SWR로 즉각적인 응답 보장
+- stale-max-age로 무한 stale 방지
+- Proactive Warming으로 stale 발생 최소화
+- Write-Through로 변경 데이터 즉시 반영
+- **Trade-off**: 복잡도 증가, 일시적 stale 허용
 
 ---
 
 ## 결론
 
-Cache Stampede는 단일 솔루션으로 해결하기보다 **여러 기법을 조합**하는 것이 효과적입니다:
+Cache Stampede 해결은 **은탄환이 없습니다**. 핵심은:
 
-1. **기본**: TTL Jitter로 만료 시점 분산
-2. **애플리케이션 레벨**: Singleflight로 중복 요청 병합
-3. **분산 환경**: Redis 분산 락으로 클러스터 간 조율
-4. **사용자 경험**: SWR로 응답 속도 보장
-5. **핫 데이터**: Proactive Warming으로 선제 대응
+1. **데이터를 분류하라**: 모든 데이터에 같은 전략을 적용하지 말 것
+2. **Trade-off를 인식하라**: 일관성과 가용성 중 무엇이 더 중요한지 판단
+3. **조합을 활용하라**: 단일 솔루션보다 여러 기법 조합이 효과적
+4. **쓰기 시점을 활용하라**: Write-Through Invalidation으로 stale 기간 최소화
+5. **측정하고 조정하라**: 실제 트래픽 패턴에 맞게 파라미터 튜닝
 
-시스템의 특성(일관성 vs 가용성, 트래픽 패턴, 데이터 특성)에 따라 적절한 조합을 선택하세요.
+**최종 권장 기본 구성**:
+```
+기본: TTL Jitter (모든 캐시)
+  +
+애플리케이션: Singleflight (노드 내 중복 제거)
+  +
+데이터별: CRITICAL → 분산 락
+         NORMAL → SWR + stale-max-age
+         LOW → 긴 TTL
+  +
+공통: Write-Through Invalidation (데이터 변경 시 즉시 무효화)
+```
+
+시스템의 특성과 비즈니스 요구사항에 따라 이 구성을 기반으로 조정하세요.
