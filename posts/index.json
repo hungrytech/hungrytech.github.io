@@ -1,5 +1,12 @@
 [
   {
+    "slug": "cache-stampede-solution",
+    "title": "Cache Stampede 문제와 해결 방법",
+    "date": "2026-02-15",
+    "description": "Cache Stampede(Thundering Herd) 현상의 원인과 6가지 해결 방법: 분산 락, XFetch, Singleflight, SWR, TTL Jitter, Proactive Warming",
+    "category": "problem-solved"
+  },
+  {
     "slug": "distributed-lock-comparison",
     "title": "Redis 분산락 심화: SETNX Polling vs Pub/Sub Blocking",
     "date": "2026-02-15",
