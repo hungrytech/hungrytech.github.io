@@ -223,13 +223,55 @@ SETNX의 단순함과 Blocking의 효율성을 결합한 접근법입니다.
 - **락 저장**: `lock:<name>` - SETNX로 관리
 - **신호 전달**: `lock-signal:<name>` - BLPOP으로 블로킹 대기
 
+### 왜 두 개의 키를 사용하는가?
+
+`SET`과 `BLPOP`은 **서로 다른 Redis 자료구조**에서 동작합니다:
+
+| 명령어 | 자료구조 | 용도 |
+|--------|----------|------|
+| `SET NX` | String | 락 소유권 저장 |
+| `BLPOP` | List | 대기자 알림 (blocking) |
+
+**같은 키에서 사용 불가**: `SET`으로 생성한 String 타입 키에 `BLPOP`을 호출하면 타입 오류가 발생합니다. 따라서 **별도의 키**를 사용해야 합니다.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Key 1: "lock:order:123"         (String 타입)              │
+│  ├── SET lock:order:123 client_id NX EX 30                 │
+│  ├── GET lock:order:123                                    │
+│  ├── DEL lock:order:123                                    │
+│  └── 용도: 실제 락 상태 저장 및 소유권 확인                   │
+├─────────────────────────────────────────────────────────────┤
+│  Key 2: "signal:lock:order:123"  (List 타입)                │
+│  ├── BLPOP signal:lock:order:123 30  (blocking 대기)        │
+│  ├── LPUSH signal:lock:order:123 "1" (unlock 신호 발송)     │
+│  └── 용도: 락 해제 알림 전용 (대기 → 신호 수신)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 동작 흐름
+
+```
+Client A                              Client B
+────────                              ────────
+SET lock NX EX 30 → "OK" (락 획득)
+                                      SET lock NX → nil (실패)
+                                      BLPOP signal 30 (blocking 대기 시작)
+                                           │
+... 작업 수행 중 ...                        │ (대기 중, CPU 사용 없음)
+                                           │
+DEL lock (락 해제)                          │
+LPUSH signal "1" ─────────────────────────→ BLPOP 반환 (신호 수신!)
+                                      SET lock NX → "OK" (락 획득 성공)
+```
+
 ### Kotlin 구현
 
 ```kotlin
 class BlockingRedisLock(
     private val redis: RedisCommands<String, String>,
     private val lockKey: String,
-    private val signalKey: String = "signal:$lockKey",
+    private val signalKey: String = "signal:$lockKey",  // 별도의 List 키
     private val ttlSeconds: Long = 30
 ) {
     private val clientId = UUID.randomUUID().toString()
@@ -245,36 +287,40 @@ class BlockingRedisLock(
 
     private suspend fun acquire() {
         while (true) {
-            // 1. SETNX로 락 획득 시도
+            // 1. SETNX로 락 획득 시도 (String 자료구조)
             val result = redis.set(
-                lockKey, 
+                lockKey,        // "lock:order:123"
                 clientId, 
                 SetArgs().nx().ex(ttlSeconds)
             )
             if (result == "OK") return
 
-            // 2. BLPOP으로 신호 대기 (blocking, no CPU waste)
-            redis.blpop(ttlSeconds.toDouble(), signalKey)
+            // 2. BLPOP으로 신호 대기 (List 자료구조, blocking)
+            redis.blpop(ttlSeconds.toDouble(), signalKey)  // "signal:lock:order:123"
             // 신호 수신 또는 타임아웃 후 재시도
         }
     }
 
     private fun release() {
-        // Lua 스크립트: 락 해제 + 다음 대기자에게 신호
+        // Lua 스크립트: 락 해제(String) + 신호 발송(List)
         val script = """
             if redis.call('get', KEYS[1]) == ARGV[1] then
-                redis.call('del', KEYS[1])
-                redis.call('lpush', KEYS[2], '1')
+                redis.call('del', KEYS[1])           -- String: 락 삭제
+                redis.call('lpush', KEYS[2], '1')    -- List: 신호 push
                 return 1
             end
             return 0
         """
-        redis.eval<Long>(script, listOf(lockKey, signalKey), listOf(clientId))
+        redis.eval<Long>(
+            script, 
+            listOf(lockKey, signalKey),  // KEYS[1]=lockKey, KEYS[2]=signalKey
+            listOf(clientId)              // ARGV[1]=clientId
+        )
     }
 }
 
 // 사용 예시
-val lock = BlockingRedisLock(redis, "order:12345")
+val lock = BlockingRedisLock(redis, "lock:order:12345")
 lock.withLock {
     processOrder()
 }
@@ -285,7 +331,13 @@ lock.withLock {
 > **"If multiple clients are blocked for the same key, the first client to be served is the one that has been waiting the longest."**
 > — Redis Documentation
 
-BLPOP은 자연스럽게 **FIFO 순서**를 보장합니다.
+BLPOP은 자연스럽게 **FIFO 순서**를 보장합니다. 먼저 대기한 클라이언트가 먼저 신호를 받습니다.
+
+### python-redis-lock 라이브러리의 동일한 접근법
+
+이 패턴은 [python-redis-lock](https://github.com/ionelmc/python-redis-lock) 라이브러리에서도 동일하게 사용됩니다:
+
+> "Uses 2 keys for each lock: `lock:<name>` - a string value for the actual lock, and `lock-signal:<name>` - a list value for signaling the waiters when the lock is released."
 
 ---
 
@@ -464,3 +516,4 @@ class Singleflight<K, V> {
 - [Distributed Locks with Redis — Redis Documentation](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 - [Redisson Locks and Synchronizers](https://redisson.pro/docs/data-and-services/locks-and-synchronizers/)
 - [Implementation Principles and Best Practices of Distributed Lock — Alibaba Cloud](https://www.alibabacloud.com/blog/implementation-principles-and-best-practices-of-distributed-lock_600811)
+- [python-redis-lock — GitHub](https://github.com/ionelmc/python-redis-lock)
