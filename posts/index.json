@@ -1,5 +1,12 @@
 [
   {
+    "slug": "pdl-cdl-message-retry",
+    "title": "PDL/CDL을 활용한 메시지 발행 재처리 전략",
+    "date": "2026-02-15",
+    "description": "토스뱅크의 PDL/CDL 패턴과 아웃박스 패턴 비교, 그리고 실무 적용 사례",
+    "category": "architecture"
+  },
+  {
     "slug": "hello-world",
     "title": "블로그를 시작합니다",
     "date": "2026-02-15",
