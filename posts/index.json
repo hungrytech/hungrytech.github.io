@@ -5,12 +5,5 @@
     "date": "2026-02-15",
     "description": "Producer/Consumer Dead Letter 패턴의 동작 원리, 구현 전략, 아웃박스 패턴과의 비교",
     "category": "architecture"
-  },
-  {
-    "slug": "hello-world",
-    "title": "블로그를 시작합니다",
-    "date": "2026-02-15",
-    "description": "hungrytech.dev 기술 블로그의 첫 번째 포스트입니다.",
-    "category": "general"
   }
 ]
