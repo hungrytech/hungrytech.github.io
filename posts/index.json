@@ -1,9 +1,9 @@
 [
   {
     "slug": "pdl-cdl-message-retry",
-    "title": "PDL/CDL을 활용한 메시지 발행 재처리 전략",
+    "title": "PDL/CDL 메시지 재처리 아키텍처 심화",
     "date": "2026-02-15",
-    "description": "토스뱅크의 PDL/CDL 패턴과 아웃박스 패턴 비교, 그리고 실무 적용 사례",
+    "description": "Producer/Consumer Dead Letter 패턴의 동작 원리, 구현 전략, 아웃박스 패턴과의 비교",
     "category": "architecture"
   },
   {
