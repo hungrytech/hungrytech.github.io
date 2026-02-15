@@ -1,5 +1,12 @@
 [
   {
+    "slug": "distributed-lock-comparison",
+    "title": "Redis 분산락 심화: SETNX Polling vs Pub/Sub Blocking",
+    "date": "2026-02-15",
+    "description": "Redis 기반 분산락의 구현 방식 비교, 고경합 상황 해결 전략, Martin Kleppmann vs Antirez 논쟁 분석",
+    "category": "architecture"
+  },
+  {
     "slug": "pdl-cdl-message-retry",
     "title": "PDL/CDL 메시지 재처리 아키텍처 심화",
     "date": "2026-02-15",
