@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hungrytech.dev</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="site-logo">hungrytech.dev</a>
+    <button id="theme-toggle" class="theme-btn" aria-label="테마 전환">🌙</button>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- 사이드바 -->
+  <aside class="sidebar">
+    <div class="profile">
+      <div class="avatar">🍖</div>
+      <h2 class="profile-name">이택민</h2>
+      <p class="profile-role">Backend Developer</p>
+      <p class="profile-bio">고객에 가치를 두는,<br>주도적으로 일하는 개발자</p>
+      <div class="social-links">
+        <a href="https://github.com/hungrytech" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://www.linkedin.com/in/taekmin-lee-74712928b/" target="_blank" rel="noopener">LinkedIn</a>
+        <a href="mailto:xorals9448@gmail.com">Email</a>
+      </div>
+    </div>
+
+    <nav class="cat-nav">
+      <h3 class="cat-heading">Categories</h3>
+      <ul id="category-list" class="cat-list"></ul>
+    </nav>
+  </aside>
+
+  <!-- 메인 콘텐츠 -->
+  <main class="main">
+    <div class="search-wrap">
+      <input type="text" id="search" placeholder="포스트 검색..." autocomplete="off">
+    </div>
+    <p id="current-label" class="current-label">All Posts</p>
+    <div id="posts-grid" class="posts-grid">
+      <p class="state-msg">로딩 중...</p>
+    </div>
+  </main>
+
+</div>
+
+<footer class="site-footer">
+  <p>© 2026 hungrytech · Powered by GitHub Pages</p>
+</footer>
+
+<script>
+  /* —— 테마 —— */
+  const root = document.documentElement;
+  const btn  = document.getElementById('theme-toggle');
+  const apply = t => { root.dataset.theme = t; btn.textContent = t === 'dark' ? '☀️' : '🌙'; };
+  apply(localStorage.getItem('theme') || 'light');
+  btn.addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    localStorage.setItem('theme', next); apply(next);
+  });
+
+  /* —— 데이터 —— */
+  let posts = [];
+  let active = 'all';
+
+  async function init() {
+    try {
+      const r = await fetch('posts/index.json');
+      posts = await r.json();
+      buildSidebar();
+      render();
+    } catch {
+      document.getElementById('posts-grid').innerHTML = '<p class="state-msg err">포스트를 불러올 수 없습니다.</p>';
+    }
+  }
+
+  function buildSidebar() {
+    const counts = {};
+    posts.forEach(p => {
+      const cat = p.category || 'uncategorized';
+      counts[cat] = (counts[cat] || 0) + 1;
+    });
+
+    const ul = document.getElementById('category-list');
+    ul.appendChild(makeItem('all', `All (${posts.length})`));
+
+    Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([cat, cnt]) => ul.appendChild(makeItem(cat, `${cat} (${cnt})`)));
+  }
+
+  function makeItem(cat, label) {
+    const li = document.createElement('li');
+    li.className = 'cat-item' + (cat === active ? ' active' : '');
+    li.dataset.cat = cat;
+    li.textContent = label;
+    li.addEventListener('click', () => {
+      active = cat;
+      document.querySelectorAll('.cat-item').forEach(el =>
+        el.classList.toggle('active', el.dataset.cat === active)
+      );
+      document.getElementById('current-label').textContent =
+        cat === 'all' ? 'All Posts' : cat;
+      render();
+    });
+    return li;
+  }
+
+  function render() {
+    const q = document.getElementById('search').value.toLowerCase();
+    const filtered = posts.filter(p => {
+      const matchCat  = active === 'all' || (p.category || 'uncategorized') === active;
+      const matchText = !q ||
+        p.title.toLowerCase().includes(q) ||
+        (p.description || '').toLowerCase().includes(q);
+      return matchCat && matchText;
+    });
+
+    const grid = document.getElementById('posts-grid');
+    if (!filtered.length) {
+      grid.innerHTML = '<p class="state-msg">포스트가 없습니다.</p>';
+      return;
+    }
+    grid.innerHTML = filtered.map(p => `
+      <a class="post-card" href="post.html?slug=${encodeURIComponent(p.slug)}">
+        <div class="card-meta">
+          <span class="card-date">${p.date}</span>
+          ${p.category ? `<span class="card-cat">${p.category}</span>` : ''}
+        </div>
+        <h2 class="card-title">${p.title}</h2>
+        ${p.description ? `<p class="card-desc">${p.description}</p>` : ''}
+      </a>
+    `).join('');
+  }
+
+  document.getElementById('search').addEventListener('input', render);
+  init();
+</script>
+</body>
+</html>
