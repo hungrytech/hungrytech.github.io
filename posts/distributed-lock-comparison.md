@@ -214,6 +214,289 @@ Redisson은 **Lock Watchdog**을 통해 락 만료 문제를 해결합니다:
 
 ---
 
+## Redisson RLock 내부 구조 심층 분석
+
+Redisson의 RLock이 내부적으로 어떻게 동작하는지 [소스 코드](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLock.java)를 기반으로 분석합니다.
+
+### Redis 자료구조: Hash
+
+Redisson은 **재진입 락(Reentrant Lock)**을 지원하기 위해 단순 String이 아닌 **Hash** 자료구조를 사용합니다.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Redis Key: "myLock"  (Hash 타입)                           │
+├─────────────────────────────────────────────────────────────┤
+│  Field                      │  Value                        │
+├─────────────────────────────┼───────────────────────────────┤
+│  "UUID:threadId"            │  재진입 횟수 (예: 2)           │
+│  예: "6f3a...:45"           │                               │
+└─────────────────────────────┴───────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  Pub/Sub Channel: "redisson_lock__channel:{myLock}"         │
+│  └── unlock 시 UNLOCK_MESSAGE 발행                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 락 획득 Lua 스크립트 (tryLockInnerAsync)
+
+```lua
+-- KEYS[1] = 락 키 (예: "myLock")
+-- ARGV[1] = 락 유지 시간 (밀리초, 예: 30000)
+-- ARGV[2] = 락 소유자 식별자 (예: "UUID:threadId")
+
+-- Case 1: 락이 존재하지 않음 → 새로 획득
+if (redis.call('exists', KEYS[1]) == 0) then
+    redis.call('hincrby', KEYS[1], ARGV[2], 1);  -- Hash 필드 생성, 값 = 1
+    redis.call('pexpire', KEYS[1], ARGV[1]);     -- TTL 설정
+    return nil;  -- 성공 (nil = 락 획득)
+end;
+
+-- Case 2: 락이 존재하고, 현재 스레드가 소유자 → 재진입
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+    redis.call('hincrby', KEYS[1], ARGV[2], 1);  -- 재진입 카운터 증가
+    redis.call('pexpire', KEYS[1], ARGV[1]);     -- TTL 갱신
+    return nil;  -- 성공 (재진입)
+end;
+
+-- Case 3: 다른 스레드가 락을 보유 중 → 실패
+return redis.call('pttl', KEYS[1]);  -- 남은 TTL 반환 (대기 시간 힌트)
+```
+
+**반환값 해석**:
+- `nil`: 락 획득 성공
+- `양수`: 현재 락의 남은 TTL (밀리초) → 이 시간만큼 대기 후 재시도
+
+### 락 해제 Lua 스크립트 (unlockInnerAsync)
+
+```lua
+-- KEYS[1] = 락 키 (예: "myLock")
+-- KEYS[2] = Pub/Sub 채널 (예: "redisson_lock__channel:{myLock}")
+-- ARGV[1] = UNLOCK_MESSAGE (0L)
+-- ARGV[2] = 락 유지 시간 (밀리초)
+-- ARGV[3] = 락 소유자 식별자 (예: "UUID:threadId")
+-- ARGV[4] = publish 명령어
+
+-- 락 소유자가 아니면 nil 반환 (해제 권한 없음)
+if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then
+    return nil;
+end;
+
+-- 재진입 카운터 감소
+local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1);
+
+if (counter > 0) then
+    -- 아직 재진입 상태 → TTL만 갱신하고 락 유지
+    redis.call('pexpire', KEYS[1], ARGV[2]);
+    return 0;
+else
+    -- 카운터가 0 → 완전히 해제
+    redis.call('del', KEYS[1]);                    -- 락 삭제
+    redis.call('publish', KEYS[2], ARGV[1]);       -- 대기자에게 알림!
+    return 1;
+end;
+```
+
+**핵심 포인트**: `redis.call('publish', KEYS[2], ARGV[1])`로 대기 중인 클라이언트에게 락 해제를 알립니다.
+
+### Pub/Sub 구독 및 대기 메커니즘
+
+락 획득에 실패한 스레드는 다음 과정을 거칩니다:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RLock 대기자의 Pub/Sub 구독 흐름                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   Thread A (락 보유)              Thread B (대기 중)                     │
+│   ─────────────────              ─────────────────                      │
+│                                                                         │
+│   lock.lock() 성공                lock.lock() 호출                       │
+│       │                              │                                  │
+│       │                              ▼                                  │
+│       │                         tryLockInnerAsync()                     │
+│       │                              │                                  │
+│       │                              ▼                                  │
+│       │                         반환값 = pttl (예: 25000ms)             │
+│       │                              │                                  │
+│       │                              ▼                                  │
+│       │                         subscribe(threadId)                     │
+│       │                         채널: "redisson_lock__channel:{myLock}" │
+│       │                              │                                  │
+│       │                              ▼                                  │
+│       │                         ┌─────────────────┐                     │
+│       │                         │  Semaphore      │                     │
+│       │                         │  .tryAcquire()  │ ◀─── blocking 대기  │
+│       │                         │  (최대 25초)    │                     │
+│       │                         └────────┬────────┘                     │
+│       │                                  │                              │
+│       ▼                                  │                              │
+│   lock.unlock()                          │                              │
+│       │                                  │                              │
+│       ▼                                  │                              │
+│   unlockInnerAsync()                     │                              │
+│       │                                  │                              │
+│       ▼                                  │                              │
+│   PUBLISH ──────────────────────────────▶│                              │
+│   "redisson_lock__channel:{myLock}"      │                              │
+│   message: UNLOCK_MESSAGE                │                              │
+│                                          ▼                              │
+│                                  Semaphore.release()                    │
+│                                          │                              │
+│                                          ▼                              │
+│                                  tryLockInnerAsync() 재시도              │
+│                                          │                              │
+│                                          ▼                              │
+│                                  락 획득 성공!                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Java/Kotlin 코드로 보는 대기 로직
+
+```kotlin
+// RedissonLock.java의 lock() 메서드 핵심 로직 (Kotlin 스타일로 재구성)
+
+private fun lock(leaseTime: Long, unit: TimeUnit, interruptibly: Boolean) {
+    val threadId = Thread.currentThread().id
+    
+    // 1. 첫 번째 락 획득 시도
+    var ttl = tryAcquire(leaseTime, unit, threadId)
+    
+    // 락 획득 성공 시 즉시 반환
+    if (ttl == null) return
+    
+    // 2. 실패 시 Pub/Sub 채널 구독
+    val entry: RedissonLockEntry = subscribe(threadId).get()
+    
+    try {
+        // 3. 무한 루프로 락 획득 재시도
+        while (true) {
+            ttl = tryAcquire(leaseTime, unit, threadId)
+            
+            // 락 획득 성공
+            if (ttl == null) break
+            
+            // 4. Semaphore로 blocking 대기
+            // ttl 밀리초 동안 대기하거나, PUBLISH 메시지 수신 시 깨어남
+            if (ttl >= 0) {
+                entry.latch.tryAcquire(ttl, TimeUnit.MILLISECONDS)
+            } else {
+                entry.latch.acquire()  // 무기한 대기
+            }
+            
+            // 깨어난 후 다시 락 획득 시도 (while 루프 반복)
+        }
+    } finally {
+        // 5. 구독 해제
+        unsubscribe(entry, threadId)
+    }
+}
+```
+
+### RedissonLockEntry와 Semaphore
+
+```kotlin
+// 대기자 관리를 위한 내부 클래스 (개념적 구현)
+class RedissonLockEntry {
+    // Semaphore로 blocking 대기 구현
+    val latch = Semaphore(0)
+    
+    // Pub/Sub 메시지 수신 시 호출되는 리스너
+    val listener: MessageListener = { message ->
+        if (message == UNLOCK_MESSAGE) {
+            latch.release()  // 대기 중인 스레드 깨우기
+        }
+    }
+}
+```
+
+### Watchdog TTL 갱신 스크립트
+
+`leaseTime`을 지정하지 않으면 Watchdog이 자동으로 TTL을 갱신합니다:
+
+```lua
+-- scheduleExpirationRenewal에서 사용하는 갱신 스크립트
+-- 매 lockWatchdogTimeout/3 (기본 10초)마다 실행
+
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+    redis.call('pexpire', KEYS[1], ARGV[1]);  -- TTL 30초로 재설정
+    return 1;
+end;
+return 0;
+```
+
+### 전체 동작 흐름 요약
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Redisson RLock 전체 흐름                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐          │
+│  │   Client A   │      │    Redis     │      │   Client B   │          │
+│  └──────┬───────┘      └──────┬───────┘      └──────┬───────┘          │
+│         │                     │                     │                   │
+│         │  1. EVAL (tryLock)  │                     │                   │
+│         │────────────────────▶│                     │                   │
+│         │                     │                     │                   │
+│         │  return nil (성공)  │                     │                   │
+│         │◀────────────────────│                     │                   │
+│         │                     │                     │                   │
+│         │                     │   2. EVAL (tryLock) │                   │
+│         │                     │◀────────────────────│                   │
+│         │                     │                     │                   │
+│         │                     │   return 25000      │                   │
+│         │                     │   (남은 TTL)        │                   │
+│         │                     │────────────────────▶│                   │
+│         │                     │                     │                   │
+│         │                     │   3. SUBSCRIBE      │                   │
+│         │                     │◀────────────────────│                   │
+│         │                     │   channel:          │                   │
+│         │                     │   redisson_lock__   │                   │
+│         │                     │   channel:{myLock}  │                   │
+│         │                     │                     │                   │
+│         │                     │                     │  4. Semaphore     │
+│         │                     │                     │     .tryAcquire() │
+│         │                     │                     │     (blocking)    │
+│         │                     │                     │         ⏳        │
+│         │                     │                     │                   │
+│  ─── 작업 수행 중 ───          │                     │                   │
+│         │                     │                     │                   │
+│         │  5. EVAL (unlock)   │                     │                   │
+│         │────────────────────▶│                     │                   │
+│         │                     │                     │                   │
+│         │                     │  6. PUBLISH         │                   │
+│         │                     │  UNLOCK_MESSAGE     │                   │
+│         │                     │────────────────────▶│                   │
+│         │                     │                     │                   │
+│         │  return 1 (성공)    │                     │  7. Semaphore     │
+│         │◀────────────────────│                     │     .release()    │
+│         │                     │                     │                   │
+│         │                     │                     │  8. EVAL (tryLock)│
+│         │                     │◀────────────────────│                   │
+│         │                     │                     │                   │
+│         │                     │  return nil (성공)  │                   │
+│         │                     │────────────────────▶│                   │
+│         │                     │                     │                   │
+│  └──────┴───────┘      └──────┴───────┘      └──────┴───────┘          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 주요 설계 특징 정리
+
+| 특징 | 구현 방식 |
+|------|----------|
+| **자료구조** | Hash (재진입 카운터 저장) |
+| **락 식별자** | `UUID:threadId` |
+| **채널명** | `redisson_lock__channel:{lockName}` |
+| **대기 방식** | Semaphore + Pub/Sub Listener |
+| **TTL 갱신** | Watchdog 스케줄러 (10초 주기) |
+| **원자성** | Lua 스크립트로 보장 |
+
+---
+
 ## 방식 3: BLPOP 하이브리드
 
 SETNX의 단순함과 Blocking의 효율성을 결합한 접근법입니다.
@@ -515,5 +798,6 @@ class Singleflight<K, V> {
 - [Is Redlock safe? — Antirez](https://antirez.com/news/101)
 - [Distributed Locks with Redis — Redis Documentation](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 - [Redisson Locks and Synchronizers](https://redisson.pro/docs/data-and-services/locks-and-synchronizers/)
+- [RedissonLock.java — GitHub Source](https://github.com/redisson/redisson/blob/master/redisson/src/main/java/org/redisson/RedissonLock.java)
 - [Implementation Principles and Best Practices of Distributed Lock — Alibaba Cloud](https://www.alibabacloud.com/blog/implementation-principles-and-best-practices-of-distributed-lock_600811)
 - [python-redis-lock — GitHub](https://github.com/ionelmc/python-redis-lock)
