@@ -1,5 +1,12 @@
 [
   {
+    "slug": "virtual-thread-vs-coroutine",
+    "title": "Virtual Thread vs Coroutine: 내부 동작 원리 비교",
+    "date": "2026-02-21",
+    "description": "Java Virtual Thread와 Kotlin Coroutine의 내부 구조 비교: Continuation, CPS 변환, State Machine, 메모리 구조, 컨텍스트 스위칭 원리 분석",
+    "category": "backend"
+  },
+  {
     "slug": "resilience4j-bulkhead-pattern-guide",
     "title": "Resilience4J Bulkhead 패턴 완전 가이드",
     "date": "2026-02-21",
