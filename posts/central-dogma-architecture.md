@@ -679,6 +679,166 @@ public class DirectoryWatcherService {
 4. **에러 처리**: Watch 콜백에서 예외 발생 시 다음 Watch에 영향 없음
 5. **백오프 설정**: 네트워크 장애 시 지수 백오프 자동 적용
 
+### 10.6 런타임 Bean 재구성 전략
+
+Spring Bean은 기본적으로 싱글톤으로 시작 시점에 생성되므로, 런타임에 "Bean 자체를 재구성"하는 것은 일반적이지 않습니다. 실제로는 다음 패턴들을 사용합니다.
+
+#### 패턴 1: Bean은 그대로, 설정값만 동적으로 읽기 (권장)
+
+가장 일반적인 접근법으로, Bean 자체는 유지하고 매번 최신 설정을 조회합니다:
+
+```java
+@Service
+public class MyService {
+
+    private final DynamicConfigService configService;
+
+    public void process() {
+        // Bean은 그대로, 매번 최신 설정을 조회
+        DatabaseConfig config = configService.getDatabaseConfig();
+        // config 값으로 로직 수행
+    }
+}
+```
+
+#### 패턴 2: Connection Pool 재구성 (새 인스턴스 교체)
+
+HikariCP 같은 DataSource는 설정이 내부에 고정되므로, 새 인스턴스를 생성하고 교체해야 합니다:
+
+```java
+@Service
+@Slf4j
+public class DynamicDataSourceManager {
+
+    private final AtomicReference<HikariDataSource> dataSourceRef = new AtomicReference<>();
+
+    @PostConstruct
+    public void init() {
+        dataSourceRef.set(createDataSource(initialConfig));
+    }
+
+    public void onConfigChanged(DatabaseConfig newConfig) {
+        HikariDataSource oldDs = dataSourceRef.get();
+        HikariDataSource newDs = createDataSource(newConfig);
+
+        // 새 DataSource로 교체
+        dataSourceRef.set(newDs);
+
+        // 기존 연결 풀 graceful shutdown (진행 중인 쿼리 완료 대기)
+        if (oldDs != null) {
+            CompletableFuture.runAsync(() -> {
+                try {
+                    Thread.sleep(30000); // 기존 트랜잭션 완료 대기
+                    oldDs.close();
+                    log.info("Old datasource closed");
+                } catch (Exception e) {
+                    log.error("Error closing old datasource", e);
+                }
+            });
+        }
+    }
+
+    private HikariDataSource createDataSource(DatabaseConfig config) {
+        HikariConfig hikariConfig = new HikariConfig();
+        hikariConfig.setJdbcUrl("jdbc:mysql://" + config.getHost() + ":" + config.getPort() + "/db");
+        hikariConfig.setUsername(config.getUsername());
+        hikariConfig.setPassword(config.getPassword());
+        hikariConfig.setMaximumPoolSize(config.getMaxPoolSize());
+        return new HikariDataSource(hikariConfig);
+    }
+
+    public DataSource getDataSource() {
+        return dataSourceRef.get();
+    }
+}
+```
+
+#### 패턴 3: Routing DataSource (더 안전한 방식)
+
+Spring의 `AbstractRoutingDataSource`를 활용하여 무중단 전환:
+
+```java
+@Component
+public class DynamicRoutingDataSource extends AbstractRoutingDataSource {
+
+    private final AtomicReference<Object> currentKey = new AtomicReference<>("primary");
+    private final Map<Object, DataSource> dataSources = new ConcurrentHashMap<>();
+
+    @Override
+    protected Object determineCurrentLookupKey() {
+        return currentKey.get();
+    }
+
+    public void addDataSource(String key, DataSource dataSource) {
+        dataSources.put(key, dataSource);
+        setTargetDataSources(new HashMap<>(dataSources));
+        afterPropertiesSet(); // 변경사항 적용
+    }
+
+    public void switchTo(String key) {
+        if (dataSources.containsKey(key)) {
+            String oldKey = (String) currentKey.getAndSet(key);
+            log.info("Switched datasource from {} to {}", oldKey, key);
+
+            // 이전 DataSource 정리 (비동기)
+            scheduleCleanup(oldKey);
+        }
+    }
+}
+```
+
+#### 패턴 4: HTTP Client 재구성
+
+```java
+@Service
+@Slf4j
+public class ConfigurableHttpClient {
+
+    private final DynamicConfigService configService;
+    private final AtomicReference<WebClient> clientRef = new AtomicReference<>();
+
+    @PostConstruct
+    public void init() {
+        rebuildClient(configService.getApiConfig());
+
+        // 설정 변경 감지
+        configService.watchApiConfig(this::rebuildClient);
+    }
+
+    private void rebuildClient(ApiConfig config) {
+        WebClient newClient = WebClient.builder()
+            .baseUrl(config.getBaseUrl())
+            .defaultHeader("Authorization", "Bearer " + config.getApiKey())
+            .build();
+
+        clientRef.set(newClient);
+        log.info("WebClient rebuilt with new config");
+    }
+
+    public WebClient getClient() {
+        return clientRef.get();
+    }
+}
+```
+
+#### 설정 종류별 재구성 전략
+
+| 설정 종류 | 재구성 필요? | 권장 방법 |
+|----------|------------|----------|
+| **Feature Flag** | X | `AtomicReference`로 값만 교체 |
+| **API Key** | X | `volatile` 변수로 관리 |
+| **타임아웃 값** | X | 매 요청마다 최신값 조회 |
+| **DB Connection Pool** | O | 새 Pool 생성 후 교체 |
+| **Redis Connection** | O | Lettuce/Jedis 클라이언트 재생성 |
+| **HTTP Client** | △ | 대부분 설정값만 교체 가능 |
+
+#### 핵심 원칙
+
+1. **Bean 자체를 재구성하는 것은 피한다** - 대신 설정값을 동적으로 읽음
+2. **상태를 가진 리소스(Connection Pool 등)는 새 인스턴스 생성 후 교체**
+3. **`AtomicReference`로 thread-safe하게 교체**
+4. **기존 리소스는 graceful하게 정리** (진행 중인 작업 완료 후)
+
 ## 참고 코드 위치
 
 | 구성요소 | 파일 경로 | 주요 메서드 |
