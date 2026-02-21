@@ -377,6 +377,308 @@ curl -X POST "http://centraldogma:36462/api/v1/projects/project/repos/repo/conte
 4. **신뢰성**: CompletableFuture 기반의 안정적인 비동기 처리
 5. **확장성**: 수천 개의 동시 Watch 처리 가능
 
+## 10. Spring Boot 통합
+
+### 10.1 의존성 추가
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>com.linecorp.centraldogma</groupId>
+    <artifactId>centraldogma-client-spring-boot3-starter</artifactId>
+    <version>0.68.0</version>
+</dependency>
+```
+
+```groovy
+// build.gradle
+implementation 'com.linecorp.centraldogma:centraldogma-client-spring-boot3-starter:0.68.0'
+```
+
+### 10.2 application.yml 설정
+
+```yaml
+centraldogma:
+  hosts:
+    - centraldogma.example.com:36462
+  access-token: appToken-cffed349-d573-457f-8f74-4727ad9341ce
+  health-check-interval-millis: 15000
+  initialization-timeout-millis: 10000
+  use-tls: false
+```
+
+### 10.3 실시간 설정 변경 예제
+
+#### 예제 1: 데이터베이스 연결 정보 동적 변경
+
+**설정 DTO**
+
+```java
+@Data
+public class DatabaseConfig {
+    private String host;
+    private int port;
+    private String username;
+    private String password;
+    private int maxPoolSize;
+}
+```
+
+**동적 설정 관리 서비스**
+
+```java
+@Service
+@Slf4j
+public class DynamicConfigService {
+
+    private final CentralDogma centralDogma;
+    private final ObjectMapper objectMapper;
+
+    private volatile DatabaseConfig databaseConfig;
+    private Watcher<JsonNode> watcher;
+
+    public DynamicConfigService(CentralDogma centralDogma, ObjectMapper objectMapper) {
+        this.centralDogma = centralDogma;
+        this.objectMapper = objectMapper;
+    }
+
+    @PostConstruct
+    public void init() throws Exception {
+        // Watcher 생성 및 시작
+        watcher = centralDogma.forRepo("my-project", "config")
+            .watcher(Query.ofJsonPath("/database.json"))
+            .start();
+
+        // 변경 리스너 등록
+        watcher.watch((revision, jsonNode) -> {
+            log.info("Config updated to revision: {}", revision);
+            updateConfig(jsonNode);
+        });
+
+        // 초기값 로드 대기 (최대 10초)
+        watcher.awaitInitialValue(10, TimeUnit.SECONDS);
+
+        // 초기 설정 적용
+        updateConfig(watcher.latest().value());
+        log.info("Initial config loaded: {}", databaseConfig);
+    }
+
+    private void updateConfig(JsonNode jsonNode) {
+        try {
+            this.databaseConfig = objectMapper.treeToValue(jsonNode, DatabaseConfig.class);
+            // 필요시 DataSource 재구성 등 추가 작업
+            onConfigChanged(databaseConfig);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to parse config", e);
+        }
+    }
+
+    private void onConfigChanged(DatabaseConfig newConfig) {
+        // 설정 변경 시 수행할 작업
+        // 예: HikariCP 풀 재구성, 캐시 갱신 등
+        log.info("Applying new database config: host={}, port={}",
+                 newConfig.getHost(), newConfig.getPort());
+    }
+
+    public DatabaseConfig getDatabaseConfig() {
+        return databaseConfig;
+    }
+
+    @PreDestroy
+    public void destroy() {
+        if (watcher != null) {
+            watcher.close();
+        }
+    }
+}
+```
+
+#### 예제 2: Feature Flag 실시간 토글
+
+**Feature Flag 설정**
+
+```java
+@Data
+public class FeatureFlags {
+    private boolean newCheckoutEnabled;
+    private boolean darkModeEnabled;
+    private int maxUploadSizeMb;
+    private List<String> betaUserIds;
+}
+```
+
+**Feature Flag 서비스**
+
+```java
+@Service
+@Slf4j
+public class FeatureFlagService {
+
+    private final AtomicReference<FeatureFlags> flags = new AtomicReference<>(new FeatureFlags());
+    private Watcher<FeatureFlags> watcher;
+
+    public FeatureFlagService(CentralDogma centralDogma) throws Exception {
+        // map()을 사용하여 JsonNode → FeatureFlags 변환
+        this.watcher = centralDogma.forRepo("my-project", "config")
+            .watcher(Query.ofJsonPath("/features.json"))
+            .map(jsonNode -> {
+                ObjectMapper mapper = new ObjectMapper();
+                try {
+                    return mapper.treeToValue(jsonNode, FeatureFlags.class);
+                } catch (JsonProcessingException e) {
+                    throw new RuntimeException(e);
+                }
+            })
+            .start();
+
+        // 변경 시 AtomicReference 갱신
+        watcher.watch((revision, newFlags) -> {
+            log.info("Feature flags updated at revision {}", revision);
+            flags.set(newFlags);
+        });
+
+        watcher.awaitInitialValue(10, TimeUnit.SECONDS);
+        flags.set(watcher.latest().value());
+    }
+
+    // 서비스 코드에서 사용
+    public boolean isNewCheckoutEnabled() {
+        return flags.get().isNewCheckoutEnabled();
+    }
+
+    public boolean isDarkModeEnabled() {
+        return flags.get().isDarkModeEnabled();
+    }
+
+    public boolean isBetaUser(String userId) {
+        return flags.get().getBetaUserIds().contains(userId);
+    }
+}
+```
+
+#### 예제 3: 다중 설정 파일 감시
+
+```java
+@Service
+public class MultiConfigWatcherService {
+
+    private final CentralDogma centralDogma;
+    private final List<Watcher<?>> watchers = new ArrayList<>();
+
+    @PostConstruct
+    public void init() throws Exception {
+        CentralDogmaRepository repo = centralDogma.forRepo("my-project", "config");
+
+        // 여러 설정 파일을 동시에 Watch
+        Watcher<JsonNode> dbWatcher = repo
+            .watcher(Query.ofJsonPath("/database.json"))
+            .start();
+
+        Watcher<JsonNode> cacheWatcher = repo
+            .watcher(Query.ofJsonPath("/cache.json"))
+            .start();
+
+        Watcher<JsonNode> apiWatcher = repo
+            .watcher(Query.ofJsonPath("/api-keys.json"))
+            .start();
+
+        // 각각 리스너 등록
+        dbWatcher.watch((rev, config) -> updateDatabaseConfig(config));
+        cacheWatcher.watch((rev, config) -> updateCacheConfig(config));
+        apiWatcher.watch((rev, config) -> updateApiKeys(config));
+
+        watchers.addAll(List.of(dbWatcher, cacheWatcher, apiWatcher));
+
+        // 모든 초기값 대기
+        for (Watcher<?> watcher : watchers) {
+            watcher.awaitInitialValue(10, TimeUnit.SECONDS);
+        }
+    }
+
+    @PreDestroy
+    public void destroy() {
+        watchers.forEach(Watcher::close);
+    }
+}
+```
+
+#### 예제 4: 경로 패턴으로 여러 파일 감시
+
+```java
+@Service
+public class DirectoryWatcherService {
+
+    @PostConstruct
+    public void init() throws Exception {
+        CentralDogmaRepository repo = centralDogma.forRepo("my-project", "config");
+
+        // /services/** 하위의 모든 JSON 파일 감시
+        Watcher<Revision> watcher = repo
+            .watcher(PathPattern.of("/services/**/*.json"))
+            .start();
+
+        watcher.watch((revision, rev) -> {
+            log.info("Some config under /services changed at revision {}", revision);
+            // 변경된 파일들 조회
+            repo.file(PathPattern.of("/services/**/*.json"))
+                .get(revision)
+                .thenAccept(files -> {
+                    files.forEach((path, entry) -> {
+                        log.info("File: {}, Content: {}", path, entry.contentAsText());
+                    });
+                });
+        });
+    }
+}
+```
+
+### 10.4 설정 변경 흐름 (Spring Boot)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Spring Boot Application                     │
+│                                                                 │
+│  @PostConstruct                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  1. CentralDogma 클라이언트 (자동 주입)                    │   │
+│  │  2. Watcher 생성 및 시작                                  │   │
+│  │  3. 변경 리스너 등록                                      │   │
+│  │  4. awaitInitialValue() - 초기값 대기                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Runtime: 설정 변경 감지                                   │   │
+│  │  ┌───────────────────────────────────────────────────┐   │   │
+│  │  │ watcher.watch((revision, config) -> {             │   │   │
+│  │  │     // 1. 새 설정값 파싱                            │   │   │
+│  │  │     // 2. AtomicReference/volatile 업데이트        │   │   │
+│  │  │     // 3. 필요시 Bean 재구성                        │   │   │
+│  │  │ });                                               │   │   │
+│  │  └───────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  서비스 코드: 항상 최신 설정 사용                          │   │
+│  │  ┌───────────────────────────────────────────────────┐   │   │
+│  │  │ public void process() {                           │   │   │
+│  │  │     DatabaseConfig config = configService.get();  │   │   │
+│  │  │     // 항상 최신 설정으로 동작                       │   │   │
+│  │  │ }                                                 │   │   │
+│  │  └───────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 10.5 주의사항
+
+1. **Thread Safety**: 설정 객체는 `volatile` 또는 `AtomicReference`로 관리
+2. **초기화 대기**: `awaitInitialValue()`로 서비스 시작 전 초기 설정 로드 보장
+3. **리소스 정리**: `@PreDestroy`에서 `watcher.close()` 필수
+4. **에러 처리**: Watch 콜백에서 예외 발생 시 다음 Watch에 영향 없음
+5. **백오프 설정**: 네트워크 장애 시 지수 백오프 자동 적용
+
 ## 참고 코드 위치
 
 | 구성요소 | 파일 경로 | 주요 메서드 |
@@ -390,6 +692,7 @@ curl -X POST "http://centraldogma:36462/api/v1/projects/project/repos/repo/conte
 | 커밋 실행기 | `server/.../CommitExecutor.java` | `execute()`, `commit()` |
 | 리비전 DB | `server/.../DefaultCommitIdDatabase.java` | `get()`, `put()` |
 | 경로 패턴 | `server/.../PathPatternFilter.java` | `of()`, `matches()` |
+| Spring Boot 설정 | `client/java-spring-boot3-autoconfigure/.../CentralDogmaSettings.java` | `getHosts()`, `getAccessToken()` |
 
 ---
 
