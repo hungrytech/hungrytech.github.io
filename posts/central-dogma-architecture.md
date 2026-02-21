@@ -925,6 +925,238 @@ public class PaymentService {
 | 코드 복잡도 | 단순 | 약간 증가 |
 | 권장 여부 | 정적 설정에만 | **동적 설정에 권장** |
 
+## 11. 내부 통신 프로토콜
+
+### 11.1 HTTP/2 Long Polling
+
+Central Dogma는 **HTTP/2 기반 Long Polling**을 사용합니다 (WebSocket 아님). Armeria 프레임워크로 구현되어 있습니다.
+
+```
+┌──────────────┐                              ┌──────────────┐
+│   Client     │                              │   Server     │
+└──────┬───────┘                              └──────┬───────┘
+       │                                             │
+       │  GET /projects/{proj}/repos/{repo}/contents │
+       │  Headers:                                   │
+       │    If-None-Match: "5"  (lastKnownRevision)  │
+       │    Prefer: wait=60s   (timeout)             │
+       │─────────────────────────────────────────────►
+       │                                             │
+       │           [최대 60초 대기]                   │
+       │           서버가 변경을 감지할 때까지 hold   │
+       │                                             │
+       │◄────────────────────────────────────────────│
+       │  200 OK + 변경된 데이터                      │
+       │  또는                                       │
+       │  304 Not Modified (타임아웃)                │
+       │                                             │
+```
+
+#### 프로토콜 특징
+
+| 항목 | 값 |
+|------|-----|
+| **프로토콜** | HTTP/2 Long Polling |
+| **프레임워크** | Armeria (LINE 오픈소스) |
+| **기본 타임아웃** | 60초 (`DEFAULT_WATCH_TIMEOUT_MILLIS`) |
+| **Jitter** | ±20% (Thundering Herd 방지) |
+
+### 11.2 HTTP 헤더 상세
+
+**요청 헤더:**
+
+```http
+GET /projects/myproject/repos/myrepo/contents/config.json HTTP/2
+Host: dogma.example.com
+If-None-Match: "5"
+Prefer: wait=60s
+Accept: application/json
+```
+
+- `If-None-Match`: 클라이언트가 마지막으로 알고 있는 리비전
+- `Prefer: wait=60s`: 변경 대기 시간
+
+**응답 헤더 (변경 감지):**
+
+```http
+HTTP/2 200 OK
+Content-Type: application/json
+Revision: 6
+```
+
+**응답 헤더 (타임아웃):**
+
+```http
+HTTP/2 304 Not Modified
+```
+
+### 11.3 Long Polling vs WebSocket 선택 이유
+
+| 관점 | Long Polling | WebSocket |
+|------|--------------|-----------|
+| **구현 복잡도** | 단순 (HTTP 기반) | 복잡 (별도 프로토콜) |
+| **방화벽 호환성** | 높음 (표준 HTTP) | 낮음 (업그레이드 필요) |
+| **로드밸런서** | 쉬운 설정 | sticky session 필요 |
+| **리소스 사용** | 요청 단위 | 상시 연결 유지 |
+| **적합한 패턴** | 설정 변경 (드문 이벤트) | 채팅 (빈번한 이벤트) |
+
+Central Dogma는 설정 변경이 자주 발생하지 않으므로 Long Polling이 더 효율적입니다.
+
+## 12. 실패 처리 메커니즘
+
+### 12.1 클라이언트 재시도 전략
+
+**파일: `client/java/src/main/java/com/linecorp/centraldogma/client/AbstractWatcher.java`**
+
+#### 지수 백오프 + Jitter
+
+```java
+// 재시도 설정 파라미터
+delayOnSuccessMillis    // 성공 후 다음 감시까지 지연
+initialDelayMillis      // 첫 재시도 대기 시간
+maxDelayMillis          // 최대 대기 시간
+multiplier = 2.0        // 지수 증가 배수
+jitterRate = 0.2        // ±20% 랜덤 지터
+```
+
+```
+재시도 흐름:
+┌─────────────────────────────────────────────────────────────┐
+│  시도 1: 즉시 요청                                           │
+│  시도 2: initialDelayMillis × jitter(±20%)                  │
+│  시도 3: initialDelayMillis × 2 × jitter                    │
+│  시도 4: initialDelayMillis × 4 × jitter                    │
+│  ...                                                        │
+│  시도 N: min(initialDelayMillis × 2^(N-1), maxDelayMillis)  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 초기 fetch 실패 처리
+
+```java
+void doWatch(int numAttemptsSoFar) {
+    watchFile(lastKnownRevision)
+        .thenAccept(newLatest -> {
+            // 성공: 즉시 다시 감시 시작
+            notifyListeners(newLatest);
+            scheduleWatch(0);  // 재시도 카운터 리셋
+        })
+        .exceptionally(thrown -> {
+            if (numAttemptsSoFar >= 3 && isInitialFetch) {
+                // 초기 fetch 3회 연속 실패 → 설정 오류로 판단
+                // 재시도 중단, 예외 전파
+                fail(thrown);
+            } else {
+                // 지수 백오프로 재시도
+                scheduleWatch(numAttemptsSoFar + 1);
+            }
+        });
+}
+```
+
+### 12.2 예외별 처리 전략
+
+| 예외 | 처리 방식 |
+|------|----------|
+| `EntryNotFoundException` | `errorOnEntryNotFound` 설정에 따라 예외 발생 또는 null 반환 |
+| `RepositoryNotFoundException` | 즉시 실패 (재시도 불필요) |
+| `TimeoutException` | 304 Not Modified 반환 후 즉시 재요청 |
+| 네트워크 오류 | 지수 백오프로 재시도 |
+| 초기 fetch 3회 실패 | 설정 오류로 판단, 재시도 중단 |
+
+### 12.3 Replication Lag 처리
+
+**파일: `client/java/src/main/java/com/linecorp/centraldogma/client/AbstractCentralDogmaBuilder.java`**
+
+클러스터 환경에서 복제 지연 발생 시:
+
+```java
+// 기본 설정
+maxNumRetriesOnReplicationLag = 5     // 최대 5회 재시도
+retryIntervalOnReplicationLag = 2000  // 2초 간격
+```
+
+### 12.4 서버 측 장애 복구
+
+**파일: `server/src/main/java/com/linecorp/centraldogma/server/internal/replication/ZooKeeperCommandExecutor.java`**
+
+#### ZooKeeper 재연결
+
+```java
+// 두 가지 재시도 정책
+RETRY_POLICY_ALWAYS: 500ms 간격으로 무한 재시도 (운영 중)
+RETRY_POLICY_NEVER: 재시도 없음 (종료 시 사용)
+```
+
+#### Graceful Degradation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    장애 발생 시 흐름                         │
+│                                                             │
+│  ZooKeeper 연결 끊김                                        │
+│        │                                                    │
+│        ▼                                                    │
+│  500ms 간격 무한 재연결 시도                                 │
+│        │                                                    │
+│        ├── 성공: 정상 운영 재개                              │
+│        │                                                    │
+│        └── 로그 재생 실패:                                   │
+│                 │                                           │
+│                 ▼                                           │
+│          읽기 전용 모드로 전환 (Graceful Degradation)        │
+│          - 읽기 요청: 정상 처리                              │
+│          - 쓰기 요청: 거부                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 12.5 Watcher 재연결 로직
+
+```java
+// AbstractWatcher.doWatch() 내부 로직
+void doWatch(int numAttemptsSoFar) {
+    Revision lastKnownRevision = latest.revision();
+    
+    watchFile(lastKnownRevision)
+        .thenAccept(newLatest -> {
+            // 성공 시
+            this.latest = newLatest;
+            notifyListeners(newLatest);
+            
+            // 지연 없이 즉시 다음 감시 시작
+            scheduleWatch(0);
+        })
+        .exceptionally(thrown -> {
+            if (shouldRetry(thrown)) {
+                // 실패 시: 지수 백오프 적용
+                scheduleWatch(numAttemptsSoFar + 1);
+            }
+            return null;
+        });
+}
+```
+
+### 12.6 안전한 값 접근 API
+
+```java
+// Watcher 인터페이스
+public interface Watcher<T> {
+    // 초기값 대기 (무한 대기)
+    Latest<T> awaitInitialValue() throws CancellationException;
+
+    // 타임아웃 지정
+    Latest<T> awaitInitialValue(long timeout, TimeUnit unit) 
+        throws TimeoutException;
+
+    // 기본값 제공 (예외 없음)
+    Latest<T> awaitInitialValue(long timeout, TimeUnit unit, T defaultValue);
+
+    // 캐시된 값 접근
+    T latestValue();                    // 초기화 전 IllegalStateException
+    T latestValue(T defaultValue);      // 초기화 전 기본값 반환
+}
+```
+
 ## 참고 코드 위치
 
 | 구성요소 | 파일 경로 | 주요 메서드 |
@@ -939,6 +1171,7 @@ public class PaymentService {
 | 리비전 DB | `server/.../DefaultCommitIdDatabase.java` | `get()`, `put()` |
 | 경로 패턴 | `server/.../PathPatternFilter.java` | `of()`, `matches()` |
 | Spring Boot 설정 | `client/java-spring-boot3-autoconfigure/.../CentralDogmaSettings.java` | `getHosts()`, `getAccessToken()` |
+| ZooKeeper 복제 | `server/.../ZooKeeperCommandExecutor.java` | 재연결, Graceful Degradation |
 
 ---
 
