@@ -839,6 +839,92 @@ public class ConfigurableHttpClient {
 3. **`AtomicReference`로 thread-safe하게 교체**
 4. **기존 리소스는 graceful하게 정리** (진행 중인 작업 완료 후)
 
+### 10.7 의존성 주입과 동적 설정 조회
+
+이미 주입된 의존성에서 **설정값을 필드에 저장하지 않고, 사용 시점에 매번 조회**하는 것이 핵심입니다.
+
+#### 잘못된 방식: 설정값을 필드에 저장
+
+```java
+@Service
+public class PaymentService {
+    private final int timeout;  // 주입 시점에 고정됨
+    
+    public PaymentService(AppConfig config) {
+        this.timeout = config.getTimeout();  // 한 번만 읽음
+    }
+    
+    public void pay() {
+        // timeout은 애플리케이션 시작 시점 값으로 고정
+        httpClient.setTimeout(timeout);
+    }
+}
+```
+
+이 방식의 문제점:
+- `timeout` 값이 생성자 호출 시점에 고정됨
+- Central Dogma에서 설정을 변경해도 반영되지 않음
+- 설정 변경을 위해 애플리케이션 재시작 필요
+
+#### 올바른 방식: 사용 시점에 조회
+
+```java
+@Service
+public class PaymentService {
+    private final Watcher<AppConfig> configWatcher;  // Watcher 주입
+    
+    public PaymentService(Watcher<AppConfig> configWatcher) {
+        this.configWatcher = configWatcher;
+    }
+    
+    public void pay() {
+        // 매번 최신 설정값 조회
+        AppConfig config = configWatcher.latest().value();
+        httpClient.setTimeout(config.getTimeout());
+    }
+}
+```
+
+이 방식의 장점:
+- 설정 변경 즉시 반영
+- 애플리케이션 재시작 불필요
+- Thread-safe (Watcher 내부에서 보장)
+
+#### 성능 우려?
+
+`Watcher.latest()`는 **내부적으로 캐싱된 값을 반환**하므로 성능 걱정이 없습니다:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Watcher 내부 구조                         │
+│                                                             │
+│  ┌─────────────────┐      ┌─────────────────────────────┐  │
+│  │   latest()      │─────►│  메모리 캐시 (즉시 반환)      │  │
+│  │   O(1) 조회     │      │  - volatile 변수             │  │
+│  └─────────────────┘      │  - 네트워크 호출 없음         │  │
+│                           └─────────────────────────────┘  │
+│                                      ▲                      │
+│                                      │ 설정 변경 시에만      │
+│  ┌─────────────────┐                 │ 서버에서 업데이트     │
+│  │  Long Polling   │─────────────────┘                      │
+│  │  (백그라운드)    │                                        │
+│  └─────────────────┘                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- **매 호출마다 네트워크 요청이 발생하지 않음**
+- 설정이 변경될 때만 서버에서 새 값을 받아옴
+- `latest()`는 단순히 메모리에 캐싱된 값을 반환 (O(1))
+
+#### 비교 정리
+
+| 구분 | 필드 저장 방식 | 동적 조회 방식 |
+|------|---------------|---------------|
+| 설정 변경 반영 | 재시작 필요 | 즉시 반영 |
+| 성능 | 약간 빠름 | Watcher 내부 캐싱으로 거의 동일 |
+| 코드 복잡도 | 단순 | 약간 증가 |
+| 권장 여부 | 정적 설정에만 | **동적 설정에 권장** |
+
 ## 참고 코드 위치
 
 | 구성요소 | 파일 경로 | 주요 메서드 |
