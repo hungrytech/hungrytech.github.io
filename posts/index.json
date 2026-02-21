@@ -1,5 +1,12 @@
 [
   {
+    "slug": "resilience4j-bulkhead-pattern-guide",
+    "title": "Resilience4J Bulkhead 패턴 완전 가이드",
+    "date": "2026-02-21",
+    "description": "선박의 격벽에서 유래한 Bulkhead 패턴으로 마이크로서비스 장애 격리와 리소스 보호를 구현하는 방법, SemaphoreBulkhead와 ThreadPoolBulkhead 비교",
+    "category": "architecture"
+  },
+  {
     "slug": "central-dogma-architecture",
     "title": "Central Dogma 아키텍처 분석",
     "date": "2026-02-21",
